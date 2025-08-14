@@ -45,7 +45,7 @@ class OCSort(object):
         ioc_thresh=0.7,
         is_ga=True,
         is_reid=False,
-
+        fuse_score=True,
         
         max_age=30, min_hits=3, 
         iou_threshold=0.3, delta_t=3, asso_func="iou", inertia=0.2, use_byte=False
@@ -84,7 +84,33 @@ class OCSort(object):
             self.clustering = Clustering(
                 eps=self.cluster_eps, min_samples=self.cluster_min_samples
             )
+            
+        self.fuse_score = fuse_score
         
+        # ----------------------------
+        # print info
+        print(f"\nOC-SORT initialized with the following parameters:")
+        print(f"  - det_thresh: {self.det_thresh}")
+        print(f"  - max_age: {self.max_age}")
+        print(f"  - min_hits: {self.min_hits}")
+        print(f"  - iou_threshold: {self.iou_threshold}")
+        print(f"  - delta_t: {self.delta_t}")
+        print(f"  - asso_func: {asso_func}")
+        print(f"  - inertia: {self.inertia}")
+        print(f"  - is_ga: {self.is_ga}")
+        print(f"  - is_reid: {self.is_reid}")
+        print(f"  - fuse_score: {self.fuse_score}")
+        print(f"  - cluster_eps: {self.cluster_eps}")
+        print(f"  - cluster_min_samples: {self.cluster_min_samples}")
+        print(f"  - frame_rate: {self.frame_rate}")
+        print(f"  - ioc_thresh: {self.ioc_thresh}")
+        print(f"  - use_byte: {self.use_byte}")
+        print(f"  - is_ga: {self.is_ga}")
+        print(f"  - _num_clusters: {self._num_clusters}")
+        print(f"  - prev_clustered_stracks: {self.prev_clustered_stracks}")
+        print(f"  - clustering: {self.clustering}")
+        print(f"  - _temp_ioc: {self._temp_ioc}")
+        print("-" * 50)
 
     def update(self, output_results, img_info, img_size):
         """
