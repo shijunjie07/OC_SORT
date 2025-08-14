@@ -5,7 +5,10 @@ from __future__ import print_function
 
 import numpy as np
 from .association import *
+from .matching import get_dists
+from .clustering import Clustering
 
+from types import SimpleNamespace
 
 def k_previous_obs(observations, cur_age, k):
     if len(observations) == 0:
@@ -16,7 +19,6 @@ def k_previous_obs(observations, cur_age, k):
             return observations[cur_age-dt]
     max_age = max(observations.keys())
     return observations[max_age]
-
 
 def convert_bbox_to_z(bbox):
     """
@@ -32,7 +34,6 @@ def convert_bbox_to_z(bbox):
     r = w / float(h+1e-6)
     return np.array([x, y, s, r]).reshape((4, 1))
 
-
 def convert_x_to_bbox(x, score=None):
     """
     Takes a bounding box in the centre form [x,y,s,r] and returns it in the form
@@ -45,6 +46,14 @@ def convert_x_to_bbox(x, score=None):
     else:
       return np.array([x[0]-w/2., x[1]-h/2., x[0]+w/2., x[1]+h/2., score]).reshape((1, 5))
 
+def convert_x_to_ltwh(x):
+    """
+    Takes a bounding box in the centre form [x,y,s,r] and returns it in the form
+      [x1,y1,w,h] where x1,y1 is the top left and w,h is the width and height
+    """
+    w = np.sqrt(x[2] * x[3])
+    h = x[2] / w
+    return np.array([x[0]-w/2., x[1]-h/2., w, h]).reshape((1, 4))
 
 def speed_direction(bbox1, bbox2):
     cx1, cy1 = (bbox1[0]+bbox1[2]) / 2.0, (bbox1[1]+bbox1[3])/2.0
@@ -157,7 +166,16 @@ class KalmanBoxTracker(object):
         Returns the current bounding box estimate.
         """
         return convert_x_to_bbox(self.kf.x)
-
+    
+    @property
+    def ltrb(self):
+        """Convert bounding box to format `(min x, min y, max x, max y)`, i.e.,
+        `(top left, bottom right)`.
+        """
+        # ret = self.ltwh.copy()
+        ret = convert_x_to_ltwh(self.kf.x)[0]
+        ret[2:] += ret[:2]
+        return ret
 
 """
     We support multiple ways for association cost calculation, by default
@@ -171,17 +189,29 @@ ASSO_FUNCS = {  "iou": iou_batch,
                 "diou": diou_batch,
                 "ct_dist": ct_dist}
 
-
 class OCSort(object):
-    def __init__(self, det_thresh, max_age=30, min_hits=3, 
-        iou_threshold=0.3, delta_t=3, asso_func="iou", inertia=0.2, use_byte=False):
+    def __init__(
+        self, det_thresh,
+        
+        
+        cluster_eps=0.3,
+        cluster_min_samples=5,
+        frame_rate=25,
+        ioc_thresh=0.7,
+        is_ga=True,
+        is_reid=True,
+
+        
+        max_age=30, min_hits=3, 
+        iou_threshold=0.3, delta_t=3, asso_func="iou", inertia=0.2, use_byte=False
+    ):
         """
         Sets key parameters for SORT
         """
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
-        self.trackers = []
+        self.trackers: list[KalmanBoxTracker] = []
         self.frame_count = 0
         self.det_thresh = det_thresh
         self.delta_t = delta_t
@@ -189,6 +219,27 @@ class OCSort(object):
         self.inertia = inertia
         self.use_byte = use_byte
         KalmanBoxTracker.count = 0
+        
+        self.is_reid = is_reid
+        
+        # group association module
+        self.is_ga = is_ga
+        self.cluster_eps = cluster_eps
+        self.cluster_min_samples = cluster_min_samples
+        self.frame_rate = frame_rate
+        self.ioc_thresh = ioc_thresh
+        
+        self._temp_ioc = []
+        self.prev_clustered_stracks = None
+        self._num_clusters = 0
+        
+        self.is_ga = is_ga
+        if self.is_ga:
+            # clustering
+            self.clustering = Clustering(
+                eps=self.cluster_eps, min_samples=self.cluster_min_samples
+            )
+        
 
     def update(self, output_results, img_info, img_size):
         """
@@ -220,6 +271,20 @@ class OCSort(object):
         dets_second = dets[inds_second]  # detections for second matching
         remain_inds = scores > self.det_thresh
         dets = dets[remain_inds]
+        
+        # object created for GA module
+        ga_detections = [
+            SimpleNamespace(
+                ltrb=dets[i, :4].copy(),
+                score=float(dets[i, 4])
+            )
+            for i in range(dets.shape[0])
+        ]
+        # map GA object to global row in dets
+        self._det_index_map = {
+            id(ga_det): i
+            for i, ga_det in enumerate(ga_detections)
+        }
 
         # get predicted locations from existing trackers.
         trks = np.zeros((len(self.trackers), 5))
@@ -239,13 +304,75 @@ class OCSort(object):
         last_boxes = np.array([trk.last_observation for trk in self.trackers])
         k_observations = np.array(
             [k_previous_obs(trk.observations, trk.age, self.delta_t) for trk in self.trackers])
+            
 
+        """
+        NEW: First round of association befor OC-SORT using Group Association Module
+        """
+        # cluster association
+        matched_ga = np.empty((0, 2), dtype=int)  # defined for later use
+
+        if self.prev_clustered_stracks and self.is_ga:
+            self._num_clusters += len(list(self.prev_clustered_stracks.keys()))
+            cluster_matched_detections, _ = self._intersection_over_cluster(
+                ga_detections, self.prev_clustered_stracks, overlap_thresh=self.ioc_thresh
+            )
+            
+            if cluster_matched_detections:
+                matched_ga, _, _ = self.cluster_matching(
+                    prev_clustered_stracks=self.prev_clustered_stracks,
+                    cluster_matched_detections=cluster_matched_detections,
+                )
+                for m in matched_ga:
+                    self.trackers[m[1]].update(dets[m[0], :])
+    
+        # empty map
+        self._det_index_map = None
+        
+        # handle unmatches
+        all_det_idxs = np.arange(len(dets), dtype=int)
+        used_det_idxs = matched_ga[:, 0] if matched_ga.size else np.array([], dtype=int)
+        dets_left_idxs = np.setdiff1d(all_det_idxs, used_det_idxs, assume_unique=False)
+        dets_left = dets[dets_left_idxs]
+        
+        all_trk_idxs = np.arange(len(self.trackers), dtype=int)
+        used_trk_idxs = matched_ga[:, 1] if matched_ga.size else np.array([], dtype=int)
+        trks_left_idxs = np.setdiff1d(all_trk_idxs, used_trk_idxs, assume_unique=False)
+        trks_left = trks[trks_left_idxs]
+        
+        vel_left  = velocities[trks_left_idxs]
+        kobs_left = k_observations[trks_left_idxs]
+
+
+        
+        # ---------------------------
+        # Original OC-SORT association
+        # ---------------------------
         """
             First round of association
         """
-        matched, unmatched_dets, unmatched_trks = associate(
-            dets, trks, self.iou_threshold, velocities, k_observations, self.inertia)
-        for m in matched:
+        # matched, unmatched_dets, unmatched_trks = associate(
+        #     dets, trks, self.iou_threshold, vel, kobs, self.inertia)
+        # for m in matched:
+        #     self.trackers[m[1]].update(dets[m[0], :])
+        
+        # local
+        matched2_local, unmatched_dets2_local, unmatched_trks2_local = associate(
+            dets_left, trks_left, self.iou_threshold, vel_left, kobs_left, self.inertia
+        )
+        # Map local -> global
+        if matched2_local.size:
+            matched2 = np.column_stack([
+                dets_left_idxs[matched2_local[:, 0]],
+                trks_left_idxs[matched2_local[:, 1]],
+            ]).astype(int)
+        else:
+            matched2 = np.empty((0, 2), dtype=int)
+            
+        unmatched_dets = dets_left_idxs[unmatched_dets2_local] if unmatched_dets2_local.size else np.empty((0,), dtype=int)
+        unmatched_trks = trks_left_idxs[unmatched_trks2_local] if unmatched_trks2_local.size else np.empty((0,), dtype=int)
+
+        for m in matched2:
             self.trackers[m[1]].update(dets[m[0], :])
 
         """
@@ -320,6 +447,26 @@ class OCSort(object):
             # remove dead tracklet
             if(trk.time_since_update > self.max_age):
                 self.trackers.pop(i)
+    
+        """
+        NEW: Group Association Module
+        """
+        if self.is_ga:
+            # update clusters to prev_clusters
+            
+            # get current activated tracks
+            output_stracks = [
+                trk
+                for trk in self.trackers
+                # if trk.time_since_update < 1 and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits)
+                if trk.time_since_update == 0
+            ]
+            clustered_stracks = []
+            if len(output_stracks) > self.cluster_min_samples:
+                clustered_stracks, outliers = self.clustering.get_clusters(output_stracks)
+            self.prev_clustered_stracks = clustered_stracks
+    
+        # return
         if(len(ret) > 0):
             return np.concatenate(ret)
         return np.empty((0, 5))
@@ -429,3 +576,215 @@ class OCSort(object):
         return np.empty((0, 7))
 
 
+    # ------------------------------------
+    # Group Association Module
+    def _intersection_over_cluster(
+        self, detections:list[KalmanBoxTracker],
+        prev_clustered_stracks:dict[int, list[KalmanBoxTracker]],
+        overlap_thresh=0.7,
+    ):
+        """
+        Association between detection with previous clusters
+
+        Args:
+            detections (list): detections
+            prev_clustered_stracks (dict): previous frame clusters
+
+        Returns:
+            Tuple[dict, list]: matched and unmatched detections
+        """
+        detections_ltrb = [det.ltrb for det in detections]
+        clusters_bbox = {}
+        for idx, cluster in prev_clustered_stracks.items():
+            cluster = [prev_trks.ltrb for prev_trks in cluster]
+            # calculate overall bouding box in ltrb format
+            clusters_bbox[idx] = [
+                min([det[0] for det in cluster]),
+                min([det[1] for det in cluster]),
+                max([det[2] for det in cluster]),
+                max([det[3] for det in cluster])
+            ]
+ 
+        unmatched_detections = []
+        matched_detections = {k: [] for k in prev_clustered_stracks.keys()}
+        for i, detection_ltrb in enumerate(detections_ltrb):
+            l_detection = detection_ltrb[0]
+            t_detection = detection_ltrb[1]
+            r_detection = detection_ltrb[2]
+            b_detection = detection_ltrb[3]
+            area_det = (r_detection - l_detection) * (b_detection - t_detection)
+
+            ioc = 0
+            max_overlap_cluster_idx = None
+            for j, cluster_bbox in clusters_bbox.items():
+                # calculate IoC
+                l_overlap = max(cluster_bbox[0], l_detection)
+                t_overlap = max(cluster_bbox[1], t_detection)
+                r_overlap = min(cluster_bbox[2], r_detection)
+                b_overlap = min(cluster_bbox[3], b_detection)
+                
+                # validate overlap bb
+                if l_overlap < r_overlap and t_overlap < b_overlap:
+                    # overlap
+                    # calculate area of overlap relative to the detection
+                    area_overlap = (r_overlap - l_overlap) * (b_overlap - t_overlap)
+                    # calculate percentage of detection overlap in cluster
+                    ioc_local = area_overlap / area_det
+                    
+                    # # print("IOC local: ", ioc_local)
+                    if ioc_local < overlap_thresh:
+                        continue
+                    # find the max ioc associates cluster
+                    if ioc_local > ioc:
+                        self._temp_ioc.append(ioc_local)
+                        ioc = ioc_local
+                        max_overlap_cluster_idx = j
+
+            # update detection
+            if max_overlap_cluster_idx is not None:
+                # matched
+                matched_detections[max_overlap_cluster_idx].append(detections[i])
+            else:
+                # unmatched
+                unmatched_detections.append(detections[i])
+
+        # drop empty clusters
+        matched_detections = {k: v for k, v in matched_detections.items() if v}
+
+        return matched_detections, unmatched_detections
+
+    # def cluster_matching(
+    #     self, prev_clustered_stracks:dict[int, list[STrack]],
+    #     cluster_matched_detections: dict[int, list[STrack]],
+    # ) -> tuple[list[STrack], list[STrack], list[STrack], list[STrack]]:
+        
+    #     ga_activated_stracks = []
+    #     activated_stracks, refind_stracks = [], []
+
+    #     u_tracks, u_detections = [], []
+    #     res_tracks, res_detections = [], []
+    #     # -------------------------
+    #     # for each cluster
+    #     for i, cluster_stracks in prev_clustered_stracks.items():
+    #         if i not in cluster_matched_detections.keys():
+    #             res_tracks.extend(cluster_stracks)
+    #             continue
+    #         track_ = cluster_stracks
+    #         det_ = cluster_matched_detections[i]
+
+    #         # calculate distance
+    #         dists = get_dists(
+    #             cluster_stracks, cluster_matched_detections[i],
+    #             _fuse_score=self.fuse_score,
+    #             is_reid=self.is_reid,
+    #             feature_thresh=0.8, proximity_thresh=0.5
+    #         )
+
+    #         matches, u_track_, u_det_ = linear_assignment(
+    #             cost_matrix=dists,
+    #             thresh=self.match_thresh
+    #         )
+    #         # print(f"dists: {dists}")
+    #         # print(f"matches: {matches}, ")
+            
+    #         for itracked, idet in matches:
+    #             track = track_[itracked]
+    #             det = det_[idet]
+                
+    #             # if track.state == TrackState.Tracked:
+    #             #     # update track with matched detection
+    #             #     track.update(det, self.frame_id, update_feature=self.is_reid)
+    #             #     activated_stracks.append(track)
+    #             # else:
+    #             #     # not tracked
+    #             #     track.re_activate(det, self.frame_id, new_id=False)
+    #             #     refind_stracks.append(track)
+                
+    #             # adapt to OC-SORT's update method
+    #             track.update(det)
+    #             ga_activated_stracks.append(track)
+
+    #         u_tracks_ = [track_[t] for t in u_track_]
+    #         u_detections_ = [det_[t] for t in u_det_]
+        
+    #         u_tracks = u_tracks + res_tracks + u_tracks_
+    #         u_detections = u_detections + res_detections + u_detections_
+        
+    #     return ga_activated_stracks, u_tracks, u_detections
+
+    def cluster_matching(
+        self,
+        prev_clustered_stracks: dict[int, list],          # lists of KalmanBoxTracker (tracks)
+        cluster_matched_detections: dict[int, list],      # lists of detection objects; each must have .det_index
+    ):
+        """
+        Returns (matched, unmatched_dets, unmatched_trks) in the same format as OC-SORT's `associate`.
+        matched:        (K, 2) int array, rows [det_idx, trk_idx]  (GLOBAL indices)
+        unmatched_dets: (D,)   int array of GLOBAL detection row indices
+        unmatched_trks: (T,)   int array of GLOBAL tracker indices (indexes into self.trackers)
+        """
+
+        # ---- Build global index maps (once per call) ----
+        track_index_map = {id(trk): i for i, trk in enumerate(self.trackers)}
+        det_index_map = self._det_index_map
+        matched_pairs = []
+        unmatched_trks_set, unmatched_dets_set = set(), set()
+
+        # Initialize "everything is unmatched" for items present in these clusters
+        for trk_list in prev_clustered_stracks.values():
+            for trk in trk_list:
+                unmatched_trks_set.add(track_index_map[id(trk)])
+        for det_list in cluster_matched_detections.values():
+            for det in det_list:
+                unmatched_dets_set.add(det_index_map[id(det)])
+
+        # ---- Match within clusters that exist on both sides ----
+        for cid, track_list in prev_clustered_stracks.items():
+            if cid not in cluster_matched_detections:
+                # no detections in this cluster -> all tracks remain unmatched (already in set)
+                continue
+
+            det_list = cluster_matched_detections[cid]
+
+            # Distance/cost matrix (use your existing helper)
+            dists = get_dists(
+                track_list, det_list,
+                _fuse_score=self.fuse_score,
+                is_reid=self.is_reid,
+                feature_thresh=0.8,
+                proximity_thresh=0.5
+            )
+
+            matches, u_track_local, u_det_local = linear_assignment(
+                cost_matrix=dists,
+                thresh=self.match_thresh
+            )
+
+            # Convert local -> global indices and record matches
+            for itracked, idet in matches:
+                trk_obj = track_list[itracked]
+                det_obj = det_list[idet]
+                g_t = track_index_map[id(trk_obj)]      # index into self.trackers
+                g_d = det_index_map[id(det_obj)]        # row in dets[N, 5]
+                matched_pairs.append([g_d, g_t])
+
+                # remove from unmatched sets
+                unmatched_trks_set.discard(g_t)
+                unmatched_dets_set.discard(g_d)
+
+            # Unmatched locals remain in the sets already initialized
+            # (No extra work needed; they were added up-front.)
+
+        # Also handle clusters that exist only on the detection side (no prev tracks):
+        for cid, det_list in cluster_matched_detections.items():
+            if cid in prev_clustered_stracks:
+                continue
+            for det in det_list:
+                unmatched_dets_set.add(det_index_map[id(det)])
+
+        # ---- Final arrays in OC-SORT `associate` format ----
+        matched = np.asarray(matched_pairs, dtype=int) if matched_pairs else np.empty((0, 2), dtype=int)
+        unmatched_dets = np.array(sorted(unmatched_dets_set), dtype=int) if unmatched_dets_set else np.empty((0,), dtype=int)
+        unmatched_trks = np.array(sorted(unmatched_trks_set), dtype=int) if unmatched_trks_set else np.empty((0,), dtype=int)
+
+        return matched, unmatched_dets, unmatched_trks
