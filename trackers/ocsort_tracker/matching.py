@@ -6,7 +6,7 @@ from scipy.spatial.distance import cdist
 import math
 from cython_bbox import bbox_overlaps as bbox_ious
 import time
-from .track import STrack
+from .track import KalmanBoxTracker as STrack
 
 """
 Table for the 0.95 quantile of the chi-square distribution with N degrees of

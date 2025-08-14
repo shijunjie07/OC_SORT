@@ -1,6 +1,7 @@
 # --------------------------------
 # cluster detections
-#
+# adapted from SportsTrack's original GA Implementation
+# 
 # @author: Shi Junjie
 # Fri 3rd Jan 2025
 # --------------------------------
@@ -10,7 +11,7 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
 
-from .track import STrack
+from .track import KalmanBoxTracker
 
 class Clustering:
     """
@@ -28,12 +29,12 @@ class Clustering:
         self.eps = eps
         self.min_samples = min_samples
 
-    def get_cluster(self, stracks:list[STrack]):
+    def get_cluster(self, stracks:list[KalmanBoxTracker]):
         """
         Cluster the given stracks data and separate outliers.
 
         Args:
-            stracks (list[STrack]): frame activated stracks (output_stracks)
+            stracks (list[KalmanBoxTracker]): frame activated stracks (output_stracks)
 
         Returns:
             tuple: A dictionary of clustered data and a list of outliers.
