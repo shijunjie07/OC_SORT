@@ -46,6 +46,7 @@ class OCSort(object):
         is_ga=True,
         is_reid=False,
         fuse_score=True,
+        match_thresh=0.5,
         
         max_age=30, min_hits=3, 
         iou_threshold=0.3, delta_t=3, asso_func="iou", inertia=0.2, use_byte=False
@@ -86,6 +87,7 @@ class OCSort(object):
             )
             
         self.fuse_score = fuse_score
+        self.match_thresh = match_thresh
         
         # ----------------------------
         # print info
@@ -110,6 +112,7 @@ class OCSort(object):
         print(f"  - prev_clustered_stracks: {self.prev_clustered_stracks}")
         print(f"  - clustering: {self.clustering}")
         print(f"  - _temp_ioc: {self._temp_ioc}")
+        print(f"  - match_thresh: {self.match_thresh}")
         print("-" * 50)
 
     def update(self, output_results, img_info, img_size):
@@ -628,7 +631,7 @@ class OCSort(object):
                 proximity_thresh=0.5
             )
 
-            matches, u_track_local, u_det_local = linear_assignment(
+            matches, u_track_local, u_det_local = linear_assignment_ga(
                 cost_matrix=dists,
                 thresh=self.match_thresh
             )
